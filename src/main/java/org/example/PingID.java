@@ -153,6 +153,112 @@ public class PingID {
 		return sendRequest(request);
 	}
 	
+	// THIRD STEP
+	// test_otp
+	public JsonObject testOTP(JsonObject data) throws Exception
+	{
+		// Build the JSON payload using org.json
+		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
+		hashMap.put("finger_print", fingerprint);
+		hashMap.put("id", data.get("id").getAsString());
+		hashMap.put("otp", "839173"); // totp magic here, figure out what secret is used
+		hashMap.put("session_id", data.get("session_id").getAsString());
+		hashMap.put("meta_header", metaHeader);
+		hashMap.put("request_type", "test_otp");
+		
+		String toJSON = gson.toJson(hashMap);
+		System.out.println(toJSON);
+		
+		/*
+		 * The JWT is signed by the same keypair generated for provisioning (working)
+		 * The signature might still be goofed up though.
+		 */
+		String jwt = Jwts.builder().header().and()
+				// They also include a signature within the JWT
+				.claims(hashMap)
+				.claim("signature", f("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
+				.signWith(deviceKeyPair.getPrivate())
+				.compact();
+		
+		System.out.println("Sending " + jwt);
+		
+		HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://idpxnyl3m.pingidentity.com/AccellServer/phone_access")).header("Accept", "application/json").header("Accept-Encoding", "gzip").header("Content-Type", "application/json; charset=utf-8").header("jwt", "true").POST(HttpRequest.BodyPublishers.ofString(jwt, StandardCharsets.UTF_8)).build();
+		return sendRequest(request);
+	}
+	
+	public void finalizeOnboarding() throws Exception
+	{
+		LinkedHashMap<String, Object> body = new LinkedHashMap<String, Object>();
+		body.put("finger_print", "ZXVFM29LWEF5WmdONlAxbWxKVkE=");
+		body.put("id", "uuid:07d837fc-f5e6-d7f0-07d8-37fcf5e6d7f0");
+		body.put("nickname", "base64:aW0gZ29ubmEgdG91Y2ggeW91");
+		body.put("session_id", "acts_ohi_FHgxNh5WgZBYypww6WonLM4F8S2r8BjrP7d5hVU4KV0");
+		body.put("meta_header", metaHeader);
+		
+		Map<String, Object> securityHeader = new LinkedHashMap<>();
+		securityHeader.put("local_fallback_data_hash", "");
+		securityHeader.put("finger_print", "WWN2NlJ0V0xUZ2xJT2Y5bWFXRGc=");
+		securityHeader.put("id", "uuid:07d837fc-f5e6-d7f0-07d8-37fcf5e6d7f0");
+		securityHeader.put("ts", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))); // i assume this is time now?
+		securityHeader.put("tz", OffsetDateTime.now().getOffset().getId().replace("Z", "+0000").replace(":", ""));
+		
+		CodeGenerator codeGenerator = new DefaultCodeGenerator(HashingAlgorithm.SHA256); // or SHA256, SHA512
+		SystemTimeProvider timeProvider = new SystemTimeProvider();
+		
+		String secret = "BP26TDZUZ5SVPZJRIHCAUVREO5EWMHHV";
+		long time = timeProvider.getTime();
+		
+		String totpCode = codeGenerator.generate(secret, time); // typically 6-digit string
+		
+		body.put("security_header", securityHeader);
+		body.put("request_type", "finalize_onboarding");
+		
+		Map<String, Object> fullPayload = new LinkedHashMap<>();
+		fullPayload.put("body", body);
+		fullPayload.put("signature", "no_signature");
+		
+		// Create HTTP client with redirect handling
+		HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).connectTimeout(Duration.ofSeconds(10)).build();
+		
+		// Build request
+		// removed the gzip header
+		// jwt true or false doesn't seem to make a difference
+		HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://idpxnyl3m.pingidentity.com/AccellServer/phone_access")).header("Accept", "application/json").header("Content-Type", "application/json; charset=utf-8").header("jwt", "false").POST(HttpRequest.BodyPublishers.ofString(fullPayload.toString(), StandardCharsets.UTF_8)).build();
+		
+		// Send request asynchronously
+		CompletableFuture<Void> future = client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream()).thenAcceptAsync(response ->
+		{
+			int statusCode = response.statusCode();
+			System.out.println("Response code: " + statusCode);
+			
+			try(var is = response.body())
+			{
+				String responseBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+				System.out.println("Raw response body: " + responseBody);
+				
+				// Decode JWT payload
+				String[] parts = responseBody.split("\\.");
+				if(parts.length == 3)
+				{
+					String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
+					System.out.println("Decoded JWT payload: " + payloadJson);
+				}
+				else
+				{
+					System.out.println("Response is not a valid JWT");
+				}
+				
+			} catch(Exception e)
+			{
+				System.err.println("Failed to read or decode response: " + e.getMessage());
+			}
+		});
+		
+		// Wait (optional if you're in a main method)
+		future.join();
+		
+	}
+	
 	// fingerprint is random
 	public static String newFingerprint()
 	{
@@ -224,79 +330,6 @@ public class PingID {
 		return KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(publicKeyBytes));
 	}
 	
-	public void finalizeOnboarding() throws CodeGenerationException
-	{
-		Map<String, Object> body = new LinkedHashMap<>();
-		body.put("finger_print", "ZXVFM29LWEF5WmdONlAxbWxKVkE=");
-		body.put("id", "uuid:07d837fc-f5e6-d7f0-07d8-37fcf5e6d7f0");
-		body.put("nickname", "base64:aW0gZ29ubmEgdG91Y2ggeW91");
-		body.put("session_id", "acts_ohi_FHgxNh5WgZBYypww6WonLM4F8S2r8BjrP7d5hVU4KV0");
-		body.put("meta_header", metaHeader);
-		
-		Map<String, Object> securityHeader = new LinkedHashMap<>();
-		securityHeader.put("local_fallback_data_hash", "");
-		securityHeader.put("finger_print", "WWN2NlJ0V0xUZ2xJT2Y5bWFXRGc=");
-		securityHeader.put("id", "uuid:07d837fc-f5e6-d7f0-07d8-37fcf5e6d7f0");
-		securityHeader.put("ts", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))); // i assume this is time now?
-		securityHeader.put("tz", OffsetDateTime.now().getOffset().getId().replace("Z", "+0000").replace(":", ""));
-		
-		CodeGenerator codeGenerator = new DefaultCodeGenerator(HashingAlgorithm.SHA256); // or SHA256, SHA512
-		SystemTimeProvider timeProvider = new SystemTimeProvider();
-		
-		String secret = "BP26TDZUZ5SVPZJRIHCAUVREO5EWMHHV";
-		long time = timeProvider.getTime();
-		
-		String totpCode = codeGenerator.generate(secret, time); // typically 6-digit string
-		
-		body.put("security_header", securityHeader);
-		body.put("request_type", "finalize_onboarding");
-		
-		Map<String, Object> fullPayload = new LinkedHashMap<>();
-		fullPayload.put("body", body);
-		fullPayload.put("signature", "no_signature");
-		
-		// Create HTTP client with redirect handling
-		HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).connectTimeout(Duration.ofSeconds(10)).build();
-		
-		// Build request
-		// removed the gzip header
-		// jwt true or false doesn't seem to make a difference
-		HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://idpxnyl3m.pingidentity.com/AccellServer/phone_access")).header("Accept", "application/json").header("Content-Type", "application/json; charset=utf-8").header("jwt", "false").POST(HttpRequest.BodyPublishers.ofString(fullPayload.toString(), StandardCharsets.UTF_8)).build();
-		
-		// Send request asynchronously
-		CompletableFuture<Void> future = client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream()).thenAcceptAsync(response ->
-		{
-			int statusCode = response.statusCode();
-			System.out.println("Response code: " + statusCode);
-			
-			try(var is = response.body())
-			{
-				String responseBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-				System.out.println("Raw response body: " + responseBody);
-				
-				// Decode JWT payload
-				String[] parts = responseBody.split("\\.");
-				if(parts.length == 3)
-				{
-					String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-					System.out.println("Decoded JWT payload: " + payloadJson);
-				}
-				else
-				{
-					System.out.println("Response is not a valid JWT");
-				}
-				
-			} catch(Exception e)
-			{
-				System.err.println("Failed to read or decode response: " + e.getMessage());
-			}
-		});
-		
-		// Wait (optional if you're in a main method)
-		future.join();
-		
-	}
-	
 	private JsonObject sendRequest(HttpRequest request) throws Exception
 	{
 		// Send request asynchronously
@@ -337,28 +370,23 @@ public class PingID {
 		}
 	}
 	
-	public PublicKey getAppKeyFromFile(String pemFilePath) throws Exception
-	{
-		// Read all bytes from the PEM file
-		String pem = new String(Files.readAllBytes(new File(pemFilePath).toPath()));
-		
-		// Remove PEM headers and decode Base64
-		String base64 = pem
-				.replace("-----BEGIN PUBLIC KEY-----", "")
-				.replace("-----END PUBLIC KEY-----", "")
-				.replaceAll("\\s", "");
-		
-		byte[] keyBytes = Base64.getDecoder().decode(base64);
-		
-		// Generate public key from X.509 encoded key spec
-		X509EncodedKeySpec keySpec = new X509EncodedKeySpec(keyBytes);
-		KeyFactory keyFactory = KeyFactory.getInstance("RSA");
-		return keyFactory.generatePublic(keySpec);
-	}
-	
-	//	private PrivateKey getAppKey() throws Exception
+	//	public PublicKey getAppKeyFromFile(String pemFilePath) throws Exception
 	//	{
-	//		return KeyFactory.getInstance("RSA").generatePrivate(new RSAPrivateKeySpec(MODULUS, EXPONENT));
+	//		// Read all bytes from the PEM file
+	//		String pem = new String(Files.readAllBytes(new File(pemFilePath).toPath()));
+	//
+	//		// Remove PEM headers and decode Base64
+	//		String base64 = pem
+	//				.replace("-----BEGIN PUBLIC KEY-----", "")
+	//				.replace("-----END PUBLIC KEY-----", "")
+	//				.replaceAll("\\s", "");
+	//
+	//		byte[] keyBytes = Base64.getDecoder().decode(base64);
+	//
+	//		// Generate public key from X.509 encoded key spec
+	//		X509EncodedKeySpec keySpec = new X509EncodedKeySpec(keyBytes);
+	//		KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+	//		return keyFactory.generatePublic(keySpec);
 	//	}
 	
 	//	public static void writePEMFile() throws Exception
@@ -387,7 +415,8 @@ public class PingID {
 		// First activate the device
 		var ping = new PingID();
 		JsonObject init = ping.verifyActivationCode(activationCode);
-		ping.provision(init);
+		init = ping.provision(init);
+		init = ping.testOTP(init);
 		// Now
 	}
 }
