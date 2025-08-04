@@ -10,7 +10,10 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.json:json:20250517'
+    // https://mvnrepository.com/artifact/org.bouncycastle/bcpkix-jdk18on
+    implementation 'org.bouncycastle:bcpkix-jdk18on:1.81'
+    // gson preserves order
+    implementation 'com.google.code.gson:gson:2.13.1'
     implementation 'dev.samstevens.totp:totp:1.7.1'
     implementation 'io.jsonwebtoken:jjwt:0.12.6'
 
