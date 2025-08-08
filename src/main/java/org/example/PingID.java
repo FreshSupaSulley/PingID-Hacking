@@ -2,68 +2,59 @@ package org.example;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import dev.samstevens.totp.code.CodeGenerator;
-import dev.samstevens.totp.code.DefaultCodeGenerator;
-import dev.samstevens.totp.code.HashingAlgorithm;
-import dev.samstevens.totp.exceptions.CodeGenerationException;
-import dev.samstevens.totp.time.SystemTimeProvider;
-import io.jsonwebtoken.JwtBuilder;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.SignatureAlgorithm;
 import com.google.gson.Gson;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import javax.crypto.Cipher;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileWriter;
 import java.io.InputStream;
-import java.math.BigInteger;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.security.*;
-import java.security.cert.CertificateFactory;
-import java.security.interfaces.RSAPublicKey;
-import java.security.spec.RSAPrivateKeySpec;
-import java.security.spec.RSAPublicKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
-import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.stream.Collectors;
 
 public class PingID {
 	
 	private static final String serverPubKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvotTwKvoqyuXgL/IFiHbc0twX55BNh4u/+l0Yz/ieVE81A+S2dhSggVloXuCKz355+jKiDOYQgeGkEuYZnBqK3jbkYpxS83YNED7zAOxGjX6EtalHuJcmqvosrNlcpMj0DbPsfUTw/yLr7VMEqX97suZXMDNiwxQzD5FiiIjcOgVIlyrKKkRIVl3HfaPr+9Dg+dRLveHPK9M869FokounL8iWy7uYINqGwadT28nHCK1sVUjnEj1/UGkkq+/DHpmiRhM2C6GsHcsE1IEC9pBiC8prTVcRXlxBfIJwoqOjGPpWE+VpmFOP2VF4wFRadhB5zJB7L73cKvOyaOdMO0IawIDAQAB";
 	
+	private static Gson gson = new Gson();
+	private static BouncyCastleProvider bc = new BouncyCastleProvider();
+	
+	/** Generated during the "provision" request and is meant to be stored on the device */
+	private KeyPair deviceKeyPair;
+	/** Some sort of unique identifier for the device? Not sure how it's generated but can probably be random */
+	private String fingerprint;
+	/** Stored per-device and needs to be saved to allow for further communication */
+	private String id, session_id, enc_sid;
+	
+	/**
+	 * Starts at the system time and increments by 1 each time it's used (it's HOTP after all). Technically loops around
+	 * eventually
+	 */
+	private long otpCounter;
+	
+	/** Used in every request. Identifies the device */
 	private static LinkedHashMap<String, Object> metaHeader;
 	
-	private KeyPair deviceKeyPair;
-	private String fingerprint;
-	private String id, session_id, enc_sid;
-	private long otpCounter; // ~~starts at 0~~ probably not, incremenets by 1 and loops around eventually
-	
-	private Gson gson = new Gson();
-	private static BouncyCastleProvider bc;
-	
+	/** The activation code, given to you as 3 4-digit segments */
 	private static final String activationCode = "4531 7263 7700".replace(" ", "");
 	
 	static
 	{
 		Security.setProperty("crypto.policy", "unlimited"); // do we need this? random tut said to include it
 		
-		Security.addProvider(bc = new BouncyCastleProvider());
-		Security.insertProviderAt(bc, 1); // pingid has this too
+		Security.addProvider(bc);
+		Security.insertProviderAt(bc, 1); // pingid has this too, but this doesn't seem to do anything
 		
-		// Build the JSON payload using org.json
+		// Edit these as you see fit
 		metaHeader = new LinkedHashMap<String, Object>();
 		metaHeader.put("api_version", "18.0");
 		metaHeader.put("app_version", "1.23.0(13063)");
@@ -75,66 +66,83 @@ public class PingID {
 		metaHeader.put("pingid_mdm_token", "");
 		metaHeader.put("model", "YOU GOT FUCKING TROLLED");
 		metaHeader.put("network_type", "mobile");
-		metaHeader.put("networks_info", "base64:d3M6e3dlOiBbXX0sbXM6e2E6IG0sIHBUOiBHU00sbmNzOiB7fX0=");
+		metaHeader.put("networks_info", "base64:d3M6e3dlOiBbXX0sbXM6e2E6IG0sIHBUOiBHU00sbmNzOiB7fX0="); // no clue what this means, probably has 0 impact for our purposes
 		metaHeader.put("os_version", "9");
 		metaHeader.put("pretty_model", "cybersecurity best get on this one");
 		metaHeader.put("is_root", true);
 		metaHeader.put("vendor", "Google");
 	}
 	
-	public String h(String sid, int otpLength, boolean isHotp) throws Exception
+	public String generateOTP(int otpLength, boolean isHotp)
 	{
-		// ^ sid is already being passed in ciphered
-		String strN = n(fingerprint, sid);
+		String strN = blendFingerprintAndSID();
 		if(!isHotp)
 		{
 			String strA = a(strN, otpCounter, otpLength);
-			this.otpCounter = c(otpCounter);
+			this.otpCounter = incrementOTPCounter(otpCounter);
 			System.err.println("BUMPING OTP");
 			System.out.println(isHotp + " RESULT " + strA);
 			return strA;
 		}
 		// Use time??
-		long jY0 = y0();
+		long jY0 = getTOTPNow();
 		String strA2 = a(strN, Long.valueOf(jY0), otpLength);
 		System.out.println(isHotp + " RESULT " + strA2);
 		return strA2;
 	}
 	
-	public static final long f9881b = 72057594037927935L;
+	/**
+	 * Ripped straight from the decompilation. Some sort of obfuscated logic that's used for OTP generation.
+	 *
+	 * @return a hybrid of fingerprint and <code>enc_sid</code>
+	 */
+	public String blendFingerprintAndSID()
+	{
+		byte[] bytes = fingerprint.getBytes();
+		byte b2 = bytes[0];
+		int length = b2 % fingerprint.length();
+		byte b3 = bytes[length];
+		int i = (b3 % 30) + 30;
+		int iMin = (Math.min(fingerprint.length(), enc_sid.length()) * i) / 100;
+		String strSubstring = fingerprint.substring(0, iMin);
+		int length2 = strSubstring.length() % enc_sid.length();
+		String str = strSubstring.substring(0, length2) + enc_sid.substring(length2);
+		//		p().debug("Generate SID: firstByte: %c; ByteNumber: %d; criteria: %d; percentage: %d; length of Part1: %d; part1: %s; relativeLength: %d; result:%s", Byte.valueOf(b2), Integer.valueOf(length), Integer.valueOf(b3), Integer.valueOf(i), Integer.valueOf(iMin), strSubstring, Integer.valueOf(length2), str);
+		// ^ was also straight from decompilation. Might tell us more about what this is supposed to be
+		return str;
+	}
 	
-	public long c(long otpCounter) {
+	public long incrementOTPCounter(long otpCounter)
+	{
 		long j = otpCounter + 1;
-		if (j > f9881b) {
+		// This limit was ripped from the app. It's also used as a mask elsewhere in the app
+		if(j > 72057594037927935L)
+		{
 			return 0L;
 		}
+		
 		return j;
 	}
 	
-	private static final long V = 15000;
-	public synchronized long y0()
+	/**
+	 * Generates the TOTP that's valid for this moment. This changes every 15 seconds.
+	 *
+	 * @return the newest TOTP value
+	 */
+	public synchronized long getTOTPNow()
 	{
-		return System.currentTimeMillis() / V;
+		return System.currentTimeMillis() / 15000;
 	}
 	
-	public String a(String secret, Long counter, int codeDigits) throws Exception
+	public String a(String secret, Long counter, int codeDigits)
 	{
-		return OTP.a(secret.getBytes(StandardCharsets.UTF_8), counter.longValue(), codeDigits);
-	}
-	
-	public static String n(String val1, String val2)
-	{
-		byte[] bytes = val1.getBytes();
-		byte b2 = bytes[0];
-		int length = b2 % val1.length();
-		byte b3 = bytes[length];
-		int i = (b3 % 30) + 30;
-		int iMin = (Math.min(val1.length(), val2.length()) * i) / 100;
-		String strSubstring = val1.substring(0, iMin);
-		int length2 = strSubstring.length() % val2.length();
-		String str = strSubstring.substring(0, length2) + val2.substring(length2);
-		//		p().debug("Generate SID: firstByte: %c; ByteNumber: %d; criteria: %d; percentage: %d; length of Part1: %d; part1: %s; relativeLength: %d; result:%s", Byte.valueOf(b2), Integer.valueOf(length), Integer.valueOf(b3), Integer.valueOf(i), Integer.valueOf(iMin), strSubstring, Integer.valueOf(length2), str);
-		return str;
+		try {
+			return OTP.generateOTP(secret.getBytes(StandardCharsets.UTF_8), counter, codeDigits, false, -1);
+		} catch(Exception e) {
+			System.err.println("Failed to generate OTP");
+			// lazily wrapping as runtime exception (because this error should never happen)
+			throw new RuntimeException(e);
+		}
 	}
 	
 	public Map<String, Object> getSecurityHeader(JsonObject data) throws Exception
@@ -145,11 +153,11 @@ public class PingID {
 		securityHeader.put("id", id);
 		
 		//
-		securityHeader.put("otp", h(enc_sid, 8, false));
+		securityHeader.put("otp", generateOTP(8, false));
 		
 		securityHeader.put("ts", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))); // i assume this is time now?
 		securityHeader.put("tz", OffsetDateTime.now().getOffset().getId().replace("Z", "+0000").replace(":", ""));
-		securityHeader.put("totp", h(enc_sid, 8, true));
+		securityHeader.put("totp", generateOTP(8, true));
 		return securityHeader;
 	}
 	
@@ -192,7 +200,7 @@ public class PingID {
 		
 		// enc_count_reg_id
 		byte[] bArrDecode = Base64.getDecoder().decode(serverPubKey.getBytes(StandardCharsets.UTF_8));
-		otpCounter = y0(); // NOT m0(). This is TOTP, not HOTP
+		otpCounter = getTOTPNow(); // NOT m0(). This is TOTP, not HOTP
 		String sb = w(otpCounter);
 		
 		// Build the JSON payload using org.json
@@ -238,7 +246,7 @@ public class PingID {
 		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
 		hashMap.put("finger_print", fingerprint);
 		hashMap.put("id", id);
-		hashMap.put("otp", h(enc_sid, 6, true)); // HOTP!!
+		hashMap.put("otp", generateOTP(6, true)); // HOTP!!
 		hashMap.put("session_id", session_id);
 		hashMap.put("meta_header", metaHeader);
 		hashMap.put("request_type", "test_otp");
@@ -362,18 +370,13 @@ public class PingID {
 		return new String(Base64.getEncoder().encode(publicKey.getEncoded()));
 	}
 	
-	public static long m() throws Exception
-	{
-		return SecureRandom.getInstance("SHA1PRNG").nextLong() & f9881b;
-	}
-	
 	public static String w(long number)
 	{
 		String hexString = Long.toHexString(number);
-		return hexString.length() < 15 ? h(hexString, '0', 16) : hexString.substring((hexString.length() - 16) - 1, hexString.length() - 1);
+		return hexString.length() < 15 ? generateOTP(hexString, '0', 16) : hexString.substring((hexString.length() - 16) - 1, hexString.length() - 1);
 	}
 	
-	private static String h(String strNextLong, char c2, int length)
+	private static String generateOTP(String strNextLong, char c2, int length)
 	{
 		while(strNextLong.length() < length)
 		{
@@ -446,8 +449,8 @@ public class PingID {
 		// 1. PARAM_SECRET? <-- harder probably because it has to do with cipher bs
 		// 2. PARAM_COUNTER??
 		// how are these generated
-//		System.out.println(n("QWZieTBjcFl6d0NyRE9MQ2hDUU8=", "QdbHq7VN20v8wMUNPGhl"));
-//		System.exit(0);
+		//		System.out.println(n("QWZieTBjcFl6d0NyRE9MQ2hDUU8=", "QdbHq7VN20v8wMUNPGhl"));
+		//		System.exit(0);
 		
 		// First activate the device
 		var ping = new PingID();
@@ -456,22 +459,23 @@ public class PingID {
 		ping.session_id = init.get("session_id").getAsString();
 		init = ping.provision(init);
 		// Now do enc_sid stuff
-//		KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "BC");
-//		generator.initialize(2048); // Key size
-//		var deviceKeyPair = generator.generateKeyPair();
-//		PrivateKey privateKey = deviceKeyPair.getPrivate();
-//		PublicKey publicKey = deviceKeyPair.getPublic();
+		//		KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "BC");
+		//		generator.initialize(2048); // Key size
+		//		var deviceKeyPair = generator.generateKeyPair();
+		//		PrivateKey privateKey = deviceKeyPair.getPrivate();
+		//		PublicKey publicKey = deviceKeyPair.getPublic();
 		var privateKey = ping.deviceKeyPair.getPrivate();
 		System.out.println(privateKey.getClass().getName());
-//		String test = "PCy4sU4TMDILwU2/nGPsWPfl5W51Smrvuac2kBX4HY4si+hpD/8pFW6zexRsXLd6dkXQfxVBNIeBDMw/9LaI5rlvJnPVHCD1XuGVLjilOjn1Bo1weqmDdhuTfT/ux0UFg2z8eMgcjW2S3VLi4DQSNlUGeIcMP5brPqFdSaq52ppBYHLIAnct6ZmuljiLqXfJH8We3EWQ1yMi1bgJ2pO4mXc5NAY4hAZ74ZrQKSund0iSESQbFKHyBVisghxvZbkMSvMjy2om+3jHI9t2bhuWdjYusj1EMNGQO1Jpx5JfuioZCreRIC19P0Fhr1z6uWSXcBpob7jSLUBSBaPl9Ys1Kw==";
+		//		String test = "PCy4sU4TMDILwU2/nGPsWPfl5W51Smrvuac2kBX4HY4si+hpD/8pFW6zexRsXLd6dkXQfxVBNIeBDMw/9LaI5rlvJnPVHCD1XuGVLjilOjn1Bo1weqmDdhuTfT/ux0UFg2z8eMgcjW2S3VLi4DQSNlUGeIcMP5brPqFdSaq52ppBYHLIAnct6ZmuljiLqXfJH8We3EWQ1yMi1bgJ2pO4mXc5NAY4hAZ74ZrQKSund0iSESQbFKHyBVisghxvZbkMSvMjy2om+3jHI9t2bhuWdjYusj1EMNGQO1Jpx5JfuioZCreRIC19P0Fhr1z6uWSXcBpob7jSLUBSBaPl9Ys1Kw==";
 		Cipher cipher = Cipher.getInstance("RSA", "BC");
 		cipher.init(Cipher.DECRYPT_MODE, privateKey);
 		System.out.println(privateKey.getAlgorithm() + " " + init.get("enc_sid").getAsString());
-//		new String(cipher.doFinal(Base64.getDecoder().decode(test)));
+		//		new String(cipher.doFinal(Base64.getDecoder().decode(test)));
 		ping.enc_sid = new String(cipher.doFinal(Base64.getDecoder().decode(init.get("enc_sid").getAsString())));
 		init = ping.testOTP(init);
-		if(init.get("response_status").getAsInt() != 0) throw new Exception("test_otp failed");
-		ping.otpCounter = ping.c(ping.otpCounter);
+		if(init.get("response_status").getAsInt() != 0)
+			throw new Exception("test_otp failed");
+		ping.otpCounter = ping.incrementOTPCounter(ping.otpCounter);
 		
 		init = ping.finalizeOnboarding(init);
 		init = ping.getUserInfo(init);
