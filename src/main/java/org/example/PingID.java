@@ -48,15 +48,20 @@ public class PingID {
 	
 	private KeyPair deviceKeyPair;
 	private String fingerprint;
+	private String id, session_id, enc_sid;
+	private long otpCounter; // ~~starts at 0~~ probably not, incremenets by 1 and loops around eventually
 	
 	private Gson gson = new Gson();
 	private static BouncyCastleProvider bc;
 	
+	private static final String activationCode = "4531 7263 7700".replace(" ", "");
+	
 	static
 	{
-		Security.setProperty("crypto.policy", "unlimited");
+		Security.setProperty("crypto.policy", "unlimited"); // do we need this? random tut said to include it
 		
 		Security.addProvider(bc = new BouncyCastleProvider());
+		Security.insertProviderAt(bc, 1); // pingid has this too
 		
 		// Build the JSON payload using org.json
 		metaHeader = new LinkedHashMap<String, Object>();
@@ -68,13 +73,84 @@ public class PingID {
 		metaHeader.put("locale", "en-US");
 		metaHeader.put("disabled_location", true);
 		metaHeader.put("pingid_mdm_token", "");
-		metaHeader.put("model", "AOSP on IA Emulator");
+		metaHeader.put("model", "YOU GOT FUCKING TROLLED");
 		metaHeader.put("network_type", "mobile");
 		metaHeader.put("networks_info", "base64:d3M6e3dlOiBbXX0sbXM6e2E6IG0sIHBUOiBHU00sbmNzOiB7fX0=");
 		metaHeader.put("os_version", "9");
-		metaHeader.put("pretty_model", "google AOSP on IA Emulator");
+		metaHeader.put("pretty_model", "cybersecurity best get on this one");
 		metaHeader.put("is_root", true);
 		metaHeader.put("vendor", "Google");
+	}
+	
+	public String h(String sid, int otpLength, boolean isHotp) throws Exception
+	{
+		// ^ sid is already being passed in ciphered
+		String strN = n(fingerprint, sid);
+		if(!isHotp)
+		{
+			String strA = a(strN, otpCounter, otpLength);
+			this.otpCounter = c(otpCounter);
+			System.err.println("BUMPING OTP");
+			System.out.println(isHotp + " RESULT " + strA);
+			return strA;
+		}
+		// Use time??
+		long jY0 = y0();
+		String strA2 = a(strN, Long.valueOf(jY0), otpLength);
+		System.out.println(isHotp + " RESULT " + strA2);
+		return strA2;
+	}
+	
+	public static final long f9881b = 72057594037927935L;
+	
+	public long c(long otpCounter) {
+		long j = otpCounter + 1;
+		if (j > f9881b) {
+			return 0L;
+		}
+		return j;
+	}
+	
+	private static final long V = 15000;
+	public synchronized long y0()
+	{
+		return System.currentTimeMillis() / V;
+	}
+	
+	public String a(String secret, Long counter, int codeDigits) throws Exception
+	{
+		return OTP.a(secret.getBytes(StandardCharsets.UTF_8), counter.longValue(), codeDigits);
+	}
+	
+	public static String n(String val1, String val2)
+	{
+		byte[] bytes = val1.getBytes();
+		byte b2 = bytes[0];
+		int length = b2 % val1.length();
+		byte b3 = bytes[length];
+		int i = (b3 % 30) + 30;
+		int iMin = (Math.min(val1.length(), val2.length()) * i) / 100;
+		String strSubstring = val1.substring(0, iMin);
+		int length2 = strSubstring.length() % val2.length();
+		String str = strSubstring.substring(0, length2) + val2.substring(length2);
+		//		p().debug("Generate SID: firstByte: %c; ByteNumber: %d; criteria: %d; percentage: %d; length of Part1: %d; part1: %s; relativeLength: %d; result:%s", Byte.valueOf(b2), Integer.valueOf(length), Integer.valueOf(b3), Integer.valueOf(i), Integer.valueOf(iMin), strSubstring, Integer.valueOf(length2), str);
+		return str;
+	}
+	
+	public Map<String, Object> getSecurityHeader(JsonObject data) throws Exception
+	{
+		LinkedHashMap<String, Object> securityHeader = new LinkedHashMap<>();
+		securityHeader.put("local_fallback_data_hash", "");
+		securityHeader.put("finger_print", fingerprint);
+		securityHeader.put("id", id);
+		
+		//
+		securityHeader.put("otp", h(enc_sid, 8, false));
+		
+		securityHeader.put("ts", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))); // i assume this is time now?
+		securityHeader.put("tz", OffsetDateTime.now().getOffset().getId().replace("Z", "+0000").replace(":", ""));
+		securityHeader.put("totp", h(enc_sid, 8, true));
+		return securityHeader;
 	}
 	
 	// FIRST STEP
@@ -108,7 +184,7 @@ public class PingID {
 	public JsonObject provision(JsonObject data) throws Exception
 	{
 		// I assume the device generates a random key
-		KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+		KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "BC");
 		generator.initialize(2048); // Key size
 		deviceKeyPair = generator.generateKeyPair();
 		PrivateKey privateKey = deviceKeyPair.getPrivate();
@@ -116,17 +192,18 @@ public class PingID {
 		
 		// enc_count_reg_id
 		byte[] bArrDecode = Base64.getDecoder().decode(serverPubKey.getBytes(StandardCharsets.UTF_8));
-		String sb = w(m());
+		otpCounter = y0(); // NOT m0(). This is TOTP, not HOTP
+		String sb = w(otpCounter);
 		
 		// Build the JSON payload using org.json
 		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
 		hashMap.put("finger_print", fingerprint);
-		hashMap.put("id", data.get("id").getAsString());
+		hashMap.put("id", id);
 		hashMap.put("device_type", "Android");
 		hashMap.put("enc_count_reg_id", g(bArrDecode, sb));
 		hashMap.put("public_key", x(publicKey)); // seems right
 		hashMap.put("pushless", true); // because registrationId is null, pushless is true
-		hashMap.put("session_id", data.get("session_id").getAsString());
+		hashMap.put("session_id", session_id);
 		hashMap.put("meta_header", metaHeader);
 		hashMap.put("request_type", "provision");
 		
@@ -160,9 +237,9 @@ public class PingID {
 		// Build the JSON payload using org.json
 		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
 		hashMap.put("finger_print", fingerprint);
-		hashMap.put("id", data.get("id").getAsString());
-		hashMap.put("otp", "839173"); // totp magic here, figure out what secret is used
-		hashMap.put("session_id", data.get("session_id").getAsString());
+		hashMap.put("id", id);
+		hashMap.put("otp", h(enc_sid, 6, true)); // HOTP!!
+		hashMap.put("session_id", session_id);
 		hashMap.put("meta_header", metaHeader);
 		hashMap.put("request_type", "test_otp");
 		
@@ -186,77 +263,71 @@ public class PingID {
 		return sendRequest(request);
 	}
 	
-	public void finalizeOnboarding() throws Exception
+	// FOURTH STEP
+	// finalize_onboarding
+	public JsonObject finalizeOnboarding(JsonObject data) throws Exception
 	{
-		LinkedHashMap<String, Object> body = new LinkedHashMap<String, Object>();
-		body.put("finger_print", "ZXVFM29LWEF5WmdONlAxbWxKVkE=");
-		body.put("id", "uuid:07d837fc-f5e6-d7f0-07d8-37fcf5e6d7f0");
-		body.put("nickname", "base64:aW0gZ29ubmEgdG91Y2ggeW91");
-		body.put("session_id", "acts_ohi_FHgxNh5WgZBYypww6WonLM4F8S2r8BjrP7d5hVU4KV0");
-		body.put("meta_header", metaHeader);
+		// Build the JSON payload using org.json
+		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
+		hashMap.put("finger_print", fingerprint);
+		hashMap.put("id", id);
+		hashMap.put("nickname", "base64:" + Base64.getEncoder().encodeToString("MY AWESOME FUCKING NICKNAME".getBytes()));
+		hashMap.put("session_id", session_id);
+		hashMap.put("meta_header", metaHeader);
+		hashMap.put("request_type", "finalize_onboarding");
 		
-		Map<String, Object> securityHeader = new LinkedHashMap<>();
-		securityHeader.put("local_fallback_data_hash", "");
-		securityHeader.put("finger_print", "WWN2NlJ0V0xUZ2xJT2Y5bWFXRGc=");
-		securityHeader.put("id", "uuid:07d837fc-f5e6-d7f0-07d8-37fcf5e6d7f0");
-		securityHeader.put("ts", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))); // i assume this is time now?
-		securityHeader.put("tz", OffsetDateTime.now().getOffset().getId().replace("Z", "+0000").replace(":", ""));
+		// All steps bayond test_otp require this
+		hashMap.put("security_header", getSecurityHeader(data));
 		
-		CodeGenerator codeGenerator = new DefaultCodeGenerator(HashingAlgorithm.SHA256); // or SHA256, SHA512
-		SystemTimeProvider timeProvider = new SystemTimeProvider();
+		String toJSON = gson.toJson(hashMap);
+		System.out.println(toJSON);
 		
-		String secret = "BP26TDZUZ5SVPZJRIHCAUVREO5EWMHHV";
-		long time = timeProvider.getTime();
+		/*
+		 * The JWT is signed by the same keypair generated for provisioning (working)
+		 * The signature might still be goofed up though.
+		 */
+		String jwt = Jwts.builder().header().and()
+				// They also include a signature within the JWT
+				.claims(hashMap)
+				.claim("signature", f("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
+				.signWith(deviceKeyPair.getPrivate())
+				.compact();
 		
-		String totpCode = codeGenerator.generate(secret, time); // typically 6-digit string
+		System.out.println("Sending " + jwt);
 		
-		body.put("security_header", securityHeader);
-		body.put("request_type", "finalize_onboarding");
+		HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://idpxnyl3m.pingidentity.com/AccellServer/phone_access")).header("Accept", "application/json").header("Accept-Encoding", "gzip").header("Content-Type", "application/json; charset=utf-8").header("jwt", "true").POST(HttpRequest.BodyPublishers.ofString(jwt, StandardCharsets.UTF_8)).build();
+		return sendRequest(request);
+	}
+	
+	// FIFTH (and last) OPTIONAL STEP
+	// get_user_info
+	public JsonObject getUserInfo(JsonObject data) throws Exception
+	{
+		// Build the JSON payload using org.json
+		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
+		hashMap.put("id", id);
+		hashMap.put("meta_header", metaHeader);
+		hashMap.put("request_type", "get_user_info");
+		hashMap.put("security_header", getSecurityHeader(data));
 		
-		Map<String, Object> fullPayload = new LinkedHashMap<>();
-		fullPayload.put("body", body);
-		fullPayload.put("signature", "no_signature");
+		String toJSON = gson.toJson(hashMap);
+		System.out.println(toJSON);
 		
-		// Create HTTP client with redirect handling
-		HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).connectTimeout(Duration.ofSeconds(10)).build();
+		/*
+		 * The JWT is signed by the same keypair generated for provisioning (working)
+		 * The signature might still be goofed up though.
+		 */
+		String jwt = Jwts.builder().header().and()
+				// They also include a signature within the JWT
+				.claims(hashMap)
+				.claim("signature", f("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
+				.signWith(deviceKeyPair.getPrivate())
+				.compact();
 		
-		// Build request
-		// removed the gzip header
-		// jwt true or false doesn't seem to make a difference
-		HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://idpxnyl3m.pingidentity.com/AccellServer/phone_access")).header("Accept", "application/json").header("Content-Type", "application/json; charset=utf-8").header("jwt", "false").POST(HttpRequest.BodyPublishers.ofString(fullPayload.toString(), StandardCharsets.UTF_8)).build();
+		System.out.println("Sending " + jwt);
 		
-		// Send request asynchronously
-		CompletableFuture<Void> future = client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream()).thenAcceptAsync(response ->
-		{
-			int statusCode = response.statusCode();
-			System.out.println("Response code: " + statusCode);
-			
-			try(var is = response.body())
-			{
-				String responseBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-				System.out.println("Raw response body: " + responseBody);
-				
-				// Decode JWT payload
-				String[] parts = responseBody.split("\\.");
-				if(parts.length == 3)
-				{
-					String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-					System.out.println("Decoded JWT payload: " + payloadJson);
-				}
-				else
-				{
-					System.out.println("Response is not a valid JWT");
-				}
-				
-			} catch(Exception e)
-			{
-				System.err.println("Failed to read or decode response: " + e.getMessage());
-			}
-		});
-		
-		// Wait (optional if you're in a main method)
-		future.join();
-		
+		HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://idpxnyl3m.pingidentity.com/AccellServer/phone_access")).header("Accept", "application/json").header("Accept-Encoding", "gzip").header("Content-Type", "application/json; charset=utf-8").header("jwt", "true").POST(HttpRequest.BodyPublishers.ofString(jwt, StandardCharsets.UTF_8)).build();
+		return sendRequest(request);
 	}
 	
 	// fingerprint is random
@@ -290,8 +361,6 @@ public class PingID {
 	{
 		return new String(Base64.getEncoder().encode(publicKey.getEncoded()));
 	}
-	
-	public static final long f9881b = 72057594037927935L;
 	
 	public static long m() throws Exception
 	{
@@ -370,53 +439,41 @@ public class PingID {
 		}
 	}
 	
-	//	public PublicKey getAppKeyFromFile(String pemFilePath) throws Exception
-	//	{
-	//		// Read all bytes from the PEM file
-	//		String pem = new String(Files.readAllBytes(new File(pemFilePath).toPath()));
-	//
-	//		// Remove PEM headers and decode Base64
-	//		String base64 = pem
-	//				.replace("-----BEGIN PUBLIC KEY-----", "")
-	//				.replace("-----END PUBLIC KEY-----", "")
-	//				.replaceAll("\\s", "");
-	//
-	//		byte[] keyBytes = Base64.getDecoder().decode(base64);
-	//
-	//		// Generate public key from X.509 encoded key spec
-	//		X509EncodedKeySpec keySpec = new X509EncodedKeySpec(keyBytes);
-	//		KeyFactory keyFactory = KeyFactory.getInstance("RSA");
-	//		return keyFactory.generatePublic(keySpec);
-	//	}
-	
-	//	public static void writePEMFile() throws Exception
-	//	{
-	//		RSAPublicKeySpec keySpec = new RSAPublicKeySpec(MODULUS, EXPONENT);
-	//		KeyFactory keyFactory = KeyFactory.getInstance("RSA");
-	//		PublicKey publicKey = keyFactory.generatePublic(keySpec);
-	//
-	//		byte[] encoded = publicKey.getEncoded();
-	//
-	//		String base64Encoded = Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(encoded);
-	//		String pem = "-----BEGIN PUBLIC KEY-----\n" + base64Encoded + "\n-----END PUBLIC KEY-----";
-	//
-	//		try(FileWriter writer = new FileWriter("pingid.pem"))
-	//		{
-	//			writer.write(pem);
-	//		}
-	//
-	//		System.out.println("PEM public key written to pingid.pem");
-	//	}
-	
 	public static void main(String[] args) throws Exception
 	{
-		String activationCode = "4982 5224 0692".replace(" ", "");
+		// (new) OTP algorithm is fine
+		// 2 things we need to figure out
+		// 1. PARAM_SECRET? <-- harder probably because it has to do with cipher bs
+		// 2. PARAM_COUNTER??
+		// how are these generated
+//		System.out.println(n("QWZieTBjcFl6d0NyRE9MQ2hDUU8=", "QdbHq7VN20v8wMUNPGhl"));
+//		System.exit(0);
 		
 		// First activate the device
 		var ping = new PingID();
 		JsonObject init = ping.verifyActivationCode(activationCode);
+		ping.id = init.get("id").getAsString();
+		ping.session_id = init.get("session_id").getAsString();
 		init = ping.provision(init);
+		// Now do enc_sid stuff
+//		KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "BC");
+//		generator.initialize(2048); // Key size
+//		var deviceKeyPair = generator.generateKeyPair();
+//		PrivateKey privateKey = deviceKeyPair.getPrivate();
+//		PublicKey publicKey = deviceKeyPair.getPublic();
+		var privateKey = ping.deviceKeyPair.getPrivate();
+		System.out.println(privateKey.getClass().getName());
+//		String test = "PCy4sU4TMDILwU2/nGPsWPfl5W51Smrvuac2kBX4HY4si+hpD/8pFW6zexRsXLd6dkXQfxVBNIeBDMw/9LaI5rlvJnPVHCD1XuGVLjilOjn1Bo1weqmDdhuTfT/ux0UFg2z8eMgcjW2S3VLi4DQSNlUGeIcMP5brPqFdSaq52ppBYHLIAnct6ZmuljiLqXfJH8We3EWQ1yMi1bgJ2pO4mXc5NAY4hAZ74ZrQKSund0iSESQbFKHyBVisghxvZbkMSvMjy2om+3jHI9t2bhuWdjYusj1EMNGQO1Jpx5JfuioZCreRIC19P0Fhr1z6uWSXcBpob7jSLUBSBaPl9Ys1Kw==";
+		Cipher cipher = Cipher.getInstance("RSA", "BC");
+		cipher.init(Cipher.DECRYPT_MODE, privateKey);
+		System.out.println(privateKey.getAlgorithm() + " " + init.get("enc_sid").getAsString());
+//		new String(cipher.doFinal(Base64.getDecoder().decode(test)));
+		ping.enc_sid = new String(cipher.doFinal(Base64.getDecoder().decode(init.get("enc_sid").getAsString())));
 		init = ping.testOTP(init);
-		// Now
+		if(init.get("response_status").getAsInt() != 0) throw new Exception("test_otp failed");
+		ping.otpCounter = ping.c(ping.otpCounter);
+		
+		init = ping.finalizeOnboarding(init);
+		init = ping.getUserInfo(init);
 	}
 }
