@@ -60,7 +60,7 @@ public class PingID {
 		metaHeader = new LinkedHashMap<>();
 		metaHeader.put("api_version", "18.0");
 		metaHeader.put("app_version", "1.23.0(13063)");
-		metaHeader.put("is_device_lock", true);
+		metaHeader.put("is_device_lock", true); // probably means whether this device has a password on it
 		metaHeader.put("device_type", "Android");
 		metaHeader.put("is_biometrics_supported", false); // wtf does this mean? fingerprint?
 		metaHeader.put("locale", "en-US");
@@ -233,7 +233,7 @@ public class PingID {
 		body.put("activation_code", activationCode);
 		body.put("finger_print", fingerprint);
 		body.put("device_type", "Android");
-		body.put("is_primary", false);
+		body.put("is_primary", false); // maybe setting to true will force this device to be your new primary?
 		body.put("meta_header", metaHeader);
 		body.put("request_type", "verify_activation_code");
 		
@@ -313,6 +313,11 @@ public class PingID {
 		// Attach the device's public key that we just generated
 		claims.put("public_key", new String(Base64.getEncoder().encode(deviceKeyPair.getPublic().getEncoded())));
 		claims.put("pushless", true); // because registrationId is null, pushless is true
+		/*
+		 * ^ this probably needs to be false to get push requests support.
+		 * Sort of looks like that's not very possible right now as the app expect some kind of registrationId, which might come from firebase shit and registering an actual phone.
+		 * Hopefully that's wrong and push requests are possible
+		 */
 		claims.put("session_id", session_id);
 		claims.put("meta_header", metaHeader);
 		claims.put("request_type", "provision");
@@ -353,7 +358,8 @@ public class PingID {
 		claims.put("finger_print", fingerprint);
 		claims.put("id", id);
 		// This can take EITHER TOTP or HOTP?? See for yourself by flipping the boolean
-		// I assume the app uses an HOTP here because when HOTPs are used beyond this endpoint it expects the counter to be incremented by one
+		// I assume the app uses an HOTP here because when HOTPs are used beyond this endpoint, the server expects the counter to be incremented by one
+		// (when isTotp is false, it uses HOTP and therefore will increment the HOTP counter)
 		claims.put("otp", generateOTP(6, false));
 		claims.put("session_id", session_id);
 		claims.put("meta_header", metaHeader);
@@ -477,6 +483,8 @@ public class PingID {
 	
 	private JsonObject sendJWT(HashMap<String, Object> claims)
 	{
+		System.out.println("Pre JWT: " + gson.toJsonTree(claims).getAsJsonObject());
+		
 		String jwt = Jwts.builder().header().and()
 				// PingID also includes a separate signature within the JWT which baffles me
 				// This app has a ridiculous amount of client-side protections

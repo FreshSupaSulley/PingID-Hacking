@@ -8,7 +8,7 @@ public class Main {
 	{
 		// First activate the device
 		// This creates a file containing the serialized PingID device data in the cd
-		var ping = new PingID("2644 9963 3447", "I HATE YOU PINGID2");
+		var ping = new PingID("5086 4683 6689", "I HATE YOU PINGID2");
 		
 		// Alternatively, you can read the file that's already created
 		// This just gets the first one it finds
