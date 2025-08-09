@@ -28,8 +28,6 @@ import java.util.zip.GZIPInputStream;
 
 public class PingID {
 	
-	private static final String serverPubKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvotTwKvoqyuXgL/IFiHbc0twX55BNh4u/+l0Yz/ieVE81A+S2dhSggVloXuCKz355+jKiDOYQgeGkEuYZnBqK3jbkYpxS83YNED7zAOxGjX6EtalHuJcmqvosrNlcpMj0DbPsfUTw/yLr7VMEqX97suZXMDNiwxQzD5FiiIjcOgVIlyrKKkRIVl3HfaPr+9Dg+dRLveHPK9M869FokounL8iWy7uYINqGwadT28nHCK1sVUjnEj1/UGkkq+/DHpmiRhM2C6GsHcsE1IEC9pBiC8prTVcRXlxBfIJwoqOjGPpWE+VpmFOP2VF4wFRadhB5zJB7L73cKvOyaOdMO0IawIDAQAB";
-	
 	private static final Gson gson = new Gson();
 	private static final BouncyCastleProvider bc = new BouncyCastleProvider();
 	
@@ -89,13 +87,13 @@ public class PingID {
 	public PingID(String activationCode, String name)
 	{
 		// This is the entire PingID onboarding flow
-		verifyActivationCode(activationCode.replace(" ", "")); // remove any spaces
+		String serverPubKey = verifyActivationCode(activationCode.replace(" ", "")); // remove any spaces
 		// This is the main naming property that APPEARS to have server-side effects
 		// The nickname defined in finalizeOnboarding might do something server-side too but I haven't discovered that yet
 		metaHeader.put("pretty_model", name);
 		
 		// Begin onboarding
-		provision();
+		provision(serverPubKey);
 		testOTP();
 		finalizeOnboarding();
 		
@@ -227,7 +225,7 @@ public class PingID {
 	}
 	
 	// FIRST STEP
-	private void verifyActivationCode(String activationCode)
+	private String verifyActivationCode(String activationCode)
 	{
 		fingerprint = Base64.getEncoder().encodeToString(generateFingerprint().getBytes());
 		// Build the JSON payload using org.json
@@ -252,6 +250,8 @@ public class PingID {
 		this.id = response.get("id").getAsString();
 		// I think session ID is just for onboarding...
 		this.session_id = response.get("session_id").getAsString();
+		// We use the returned public key later
+		return response.get("public_key").getAsString();
 	}
 	
 	/**
@@ -282,7 +282,7 @@ public class PingID {
 	
 	// SECOND STEP
 	// Sends as encoeded JWT
-	private void provision()
+	private void provision(String serverPubKey)
 	{
 		try
 		{
@@ -346,28 +346,21 @@ public class PingID {
 	}
 	
 	// THIRD STEP
-	// test_otp (you're testing HOTP not TOTP in this endpoint)
 	private void testOTP()
 	{
 		// Build the JSON payload using org.json
 		LinkedHashMap<String, Object> claims = new LinkedHashMap<>();
 		claims.put("finger_print", fingerprint);
 		claims.put("id", id);
-		claims.put("otp", generateOTP(6, true)); // HOTP!!
+		// This can take EITHER TOTP or HOTP?? See for yourself by flipping the boolean
+		// I assume the app uses an HOTP here because when HOTPs are used beyond this endpoint it expects the counter to be incremented by one
+		claims.put("otp", generateOTP(6, false));
 		claims.put("session_id", session_id);
 		claims.put("meta_header", metaHeader);
 		claims.put("request_type", "test_otp");
 		
 		// We don't need the response for this particular endpoint
 		sendJWT(claims);
-		
-		/*
-		 * IMPORTANT!
-		 * Increments the HOTP counter by creating a useless HOTP
-		 * Apparently you need to do this, which makes me think it's used somewhere else in the app
-		 * ... or the app is just coded terribly (even though I only saw crumby decompilation, I could believe it)
-		 */
-		generateOTP(6, false);
 	}
 	
 	// FOURTH STEP
