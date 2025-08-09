@@ -7,12 +7,16 @@ import com.google.gson.Gson;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import javax.crypto.Cipher;
+import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.*;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Duration;
@@ -25,14 +29,15 @@ public class PingID {
 	
 	private static final String serverPubKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvotTwKvoqyuXgL/IFiHbc0twX55BNh4u/+l0Yz/ieVE81A+S2dhSggVloXuCKz355+jKiDOYQgeGkEuYZnBqK3jbkYpxS83YNED7zAOxGjX6EtalHuJcmqvosrNlcpMj0DbPsfUTw/yLr7VMEqX97suZXMDNiwxQzD5FiiIjcOgVIlyrKKkRIVl3HfaPr+9Dg+dRLveHPK9M869FokounL8iWy7uYINqGwadT28nHCK1sVUjnEj1/UGkkq+/DHpmiRhM2C6GsHcsE1IEC9pBiC8prTVcRXlxBfIJwoqOjGPpWE+VpmFOP2VF4wFRadhB5zJB7L73cKvOyaOdMO0IawIDAQAB";
 	
-	private static Gson gson = new Gson();
-	private static BouncyCastleProvider bc = new BouncyCastleProvider();
+	private static final Gson gson = new Gson();
+	private static final BouncyCastleProvider bc = new BouncyCastleProvider();
 	
 	/** Generated during the "provision" request and is meant to be stored on the device */
 	private KeyPair deviceKeyPair;
 	/** Some sort of unique identifier for the device? Not sure how it's generated but can probably be random */
 	private String fingerprint;
 	/** Stored per-device and needs to be saved to allow for further communication */
+	// ... is session_id just for provisioning?
 	private String id, session_id, enc_sid;
 	
 	/**
@@ -42,10 +47,7 @@ public class PingID {
 	private long otpCounter;
 	
 	/** Used in every request. Identifies the device */
-	private static LinkedHashMap<String, Object> metaHeader;
-	
-	/** The activation code, given to you as 3 4-digit segments */
-	private static final String activationCode = "4531 7263 7700".replace(" ", "");
+	private static final LinkedHashMap<String, Object> metaHeader;
 	
 	static
 	{
@@ -55,7 +57,7 @@ public class PingID {
 		Security.insertProviderAt(bc, 1); // pingid has this too, but this doesn't seem to do anything
 		
 		// Edit these as you see fit
-		metaHeader = new LinkedHashMap<String, Object>();
+		metaHeader = new LinkedHashMap<>();
 		metaHeader.put("api_version", "18.0");
 		metaHeader.put("app_version", "1.23.0(13063)");
 		metaHeader.put("is_device_lock", true);
@@ -73,22 +75,106 @@ public class PingID {
 		metaHeader.put("vendor", "Google");
 	}
 	
-	public String generateOTP(int otpLength, boolean isHotp)
+	public static void main(String[] args)
+	{
+		// First activate the device
+		var ping = new PingID("6103 9493 9309");
+	}
+	
+	/**
+	 * Initializes a new PingID device from an activation code.
+	 *
+	 * @param activationCode 12 digit activation code (spaces are removed)
+	 */
+	public PingID(String activationCode)
+	{
+		// Remove any spaces
+		activationCode = activationCode.replace(" ", "");
+		
+		// First activate the device
+		JsonObject data = verifyActivationCode(activationCode);
+		this.id = data.get("id").getAsString();
+		this.session_id = data.get("session_id").getAsString();
+		data = provision();
+		
+		try
+		{
+			var cipher = Cipher.getInstance("RSA", "BC");
+			cipher.init(Cipher.DECRYPT_MODE, deviceKeyPair.getPrivate());
+			this.enc_sid = new String(cipher.doFinal(Base64.getDecoder().decode(data.get("enc_sid").getAsString())));
+		} catch(Exception e)
+		{
+			throw new RuntimeException(e);
+		}
+		
+		data = testOTP();
+		
+		if(data.get("response_status").getAsInt() != 0)
+			throw new RuntimeException("test_otp failed");
+		
+		/*
+		 * Increments OTP counter by creating a useless HOTP
+		 * Apparently you need to do this, which makes me think it's used somewhere else in the app
+		 * ... or the app is just coded terribly (even though I saw crumby decompilation, I would believe it)
+		 */
+		System.out.println("BOUTTA");
+		generateOTP(6, false);
+		
+		data = finalizeOnboarding(data);
+		data = getUserInfo(data);
+		
+		System.out.println(data);
+		
+		// Write the device data to a file
+		JsonObject toFile = new JsonObject();
+		toFile.addProperty("fingerprint", fingerprint);
+		toFile.addProperty("enc_sid", enc_sid);
+		toFile.addProperty("otpCounter", otpCounter);
+		toFile.addProperty("publicKey", Base64.getEncoder().encodeToString(deviceKeyPair.getPublic().getEncoded()));
+		toFile.addProperty("privateKey", Base64.getEncoder().encodeToString(deviceKeyPair.getPrivate().getEncoded()));
+		
+		try
+		{
+			Files.writeString(Path.of("pingid_" + fingerprint), toFile.toString());
+		} catch(IOException e)
+		{
+			System.err.println("Failed to write device data to file");
+			throw new RuntimeException(e);
+		}
+	}
+	
+	public PingID(Path deviceData)
+	{
+	
+	}
+	
+	public String generateOTP(int otpLength, boolean isTotp)
 	{
 		String strN = blendFingerprintAndSID();
-		if(!isHotp)
+		long counter = getTOTPNow();
+		
+		if(!isTotp)
 		{
-			String strA = a(strN, otpCounter, otpLength);
-			this.otpCounter = incrementOTPCounter(otpCounter);
-			System.err.println("BUMPING OTP");
-			System.out.println(isHotp + " RESULT " + strA);
-			return strA;
+			// Increment OTP
+			// This limit was ripped from the app. It's also used as a mask elsewhere in the app
+			if(++otpCounter > 72057594037927935L)
+			{
+				otpCounter = 0;
+			}
+			
+			System.out.println("INCREMENTING OTP" + otpCounter);
+			counter = otpCounter;
 		}
-		// Use time??
-		long jY0 = getTOTPNow();
-		String strA2 = a(strN, Long.valueOf(jY0), otpLength);
-		System.out.println(isHotp + " RESULT " + strA2);
-		return strA2;
+		
+		try
+		{
+			return OTP.generateOTP(strN.getBytes(StandardCharsets.UTF_8), counter, otpLength, false, -1);
+		} catch(Exception e)
+		{
+			System.err.println("Failed to generate OTP");
+			// lazily wrapping as runtime exception (because this error should never happen)
+			throw new RuntimeException(e);
+		}
 	}
 	
 	/**
@@ -96,7 +182,7 @@ public class PingID {
 	 *
 	 * @return a hybrid of fingerprint and <code>enc_sid</code>
 	 */
-	public String blendFingerprintAndSID()
+	private String blendFingerprintAndSID()
 	{
 		byte[] bytes = fingerprint.getBytes();
 		byte b2 = bytes[0];
@@ -112,18 +198,6 @@ public class PingID {
 		return str;
 	}
 	
-	public long incrementOTPCounter(long otpCounter)
-	{
-		long j = otpCounter + 1;
-		// This limit was ripped from the app. It's also used as a mask elsewhere in the app
-		if(j > 72057594037927935L)
-		{
-			return 0L;
-		}
-		
-		return j;
-	}
-	
 	/**
 	 * Generates the TOTP that's valid for this moment. This changes every 15 seconds.
 	 *
@@ -134,27 +208,13 @@ public class PingID {
 		return System.currentTimeMillis() / 15000;
 	}
 	
-	public String a(String secret, Long counter, int codeDigits)
-	{
-		try {
-			return OTP.generateOTP(secret.getBytes(StandardCharsets.UTF_8), counter, codeDigits, false, -1);
-		} catch(Exception e) {
-			System.err.println("Failed to generate OTP");
-			// lazily wrapping as runtime exception (because this error should never happen)
-			throw new RuntimeException(e);
-		}
-	}
-	
-	public Map<String, Object> getSecurityHeader(JsonObject data) throws Exception
+	private Map<String, Object> getSecurityHeader(JsonObject data)
 	{
 		LinkedHashMap<String, Object> securityHeader = new LinkedHashMap<>();
 		securityHeader.put("local_fallback_data_hash", "");
 		securityHeader.put("finger_print", fingerprint);
 		securityHeader.put("id", id);
-		
-		//
 		securityHeader.put("otp", generateOTP(8, false));
-		
 		securityHeader.put("ts", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))); // i assume this is time now?
 		securityHeader.put("tz", OffsetDateTime.now().getOffset().getId().replace("Z", "+0000").replace(":", ""));
 		securityHeader.put("totp", generateOTP(8, true));
@@ -162,7 +222,7 @@ public class PingID {
 	}
 	
 	// FIRST STEP
-	public JsonObject verifyActivationCode(String activationCode) throws Exception
+	public JsonObject verifyActivationCode(String activationCode)
 	{
 		fingerprint = Base64.getEncoder().encodeToString(newFingerprint().getBytes());
 		// Build the JSON payload using org.json
@@ -189,27 +249,38 @@ public class PingID {
 	
 	// SECOND STEP
 	// Sends as encoeded JWT
-	public JsonObject provision(JsonObject data) throws Exception
+	public JsonObject provision()
 	{
-		// I assume the device generates a random key
-		KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "BC");
-		generator.initialize(2048); // Key size
-		deviceKeyPair = generator.generateKeyPair();
+		try
+		{
+			// Generate a random key to be stored on this device
+			var generator = KeyPairGenerator.getInstance("RSA", "BC");
+			generator.initialize(2048);
+			deviceKeyPair = generator.generateKeyPair();
+		} catch(Exception e)
+		{
+			throw new RuntimeException(e);
+		}
+		
 		PrivateKey privateKey = deviceKeyPair.getPrivate();
 		PublicKey publicKey = deviceKeyPair.getPublic();
 		
 		// enc_count_reg_id
-		byte[] bArrDecode = Base64.getDecoder().decode(serverPubKey.getBytes(StandardCharsets.UTF_8));
-		otpCounter = getTOTPNow(); // NOT m0(). This is TOTP, not HOTP
-		String sb = w(otpCounter);
+		byte[] rawServerPubKey = Base64.getDecoder().decode(serverPubKey.getBytes(StandardCharsets.UTF_8));
+		
+		// Update the otpCounter
+		otpCounter = getTOTPNow();
+		// Now use it to fill in the weird ass hex value
+		String totpString = Long.toHexString(otpCounter);
+		String otpCounterHex = totpString.length() < 15 ? generateOTP(totpString, '0', 16) : totpString.substring((totpString.length() - 16) - 1, totpString.length() - 1);
 		
 		// Build the JSON payload using org.json
 		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
 		hashMap.put("finger_print", fingerprint);
 		hashMap.put("id", id);
 		hashMap.put("device_type", "Android");
-		hashMap.put("enc_count_reg_id", g(bArrDecode, sb));
-		hashMap.put("public_key", x(publicKey)); // seems right
+		hashMap.put("enc_count_reg_id", createEncCountRegID(rawServerPubKey, otpCounterHex));
+		hashMap.put("public_key", new String(Base64.getEncoder().encode(publicKey.getEncoded()))); // seems right
 		hashMap.put("pushless", true); // because registrationId is null, pushless is true
 		hashMap.put("session_id", session_id);
 		hashMap.put("meta_header", metaHeader);
@@ -228,7 +299,7 @@ public class PingID {
 		String jwt = Jwts.builder().header().and()
 				// They also include a signature within the JWT
 				.claims(hashMap)
-				.claim("signature", f("SHA1withRSA", toJSON.getBytes(), privateKey)) // app key or private key??
+				.claim("signature", createSignature("SHA1withRSA", toJSON.getBytes(), privateKey)) // app key or private key??
 				.signWith(privateKey)
 				.compact();
 		
@@ -240,10 +311,10 @@ public class PingID {
 	
 	// THIRD STEP
 	// test_otp
-	public JsonObject testOTP(JsonObject data) throws Exception
+	public JsonObject testOTP()
 	{
 		// Build the JSON payload using org.json
-		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
+		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<>();
 		hashMap.put("finger_print", fingerprint);
 		hashMap.put("id", id);
 		hashMap.put("otp", generateOTP(6, true)); // HOTP!!
@@ -261,7 +332,7 @@ public class PingID {
 		String jwt = Jwts.builder().header().and()
 				// They also include a signature within the JWT
 				.claims(hashMap)
-				.claim("signature", f("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
+				.claim("signature", createSignature("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
 				.signWith(deviceKeyPair.getPrivate())
 				.compact();
 		
@@ -273,10 +344,10 @@ public class PingID {
 	
 	// FOURTH STEP
 	// finalize_onboarding
-	public JsonObject finalizeOnboarding(JsonObject data) throws Exception
+	public JsonObject finalizeOnboarding(JsonObject data)
 	{
 		// Build the JSON payload using org.json
-		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
+		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<>();
 		hashMap.put("finger_print", fingerprint);
 		hashMap.put("id", id);
 		hashMap.put("nickname", "base64:" + Base64.getEncoder().encodeToString("MY AWESOME FUCKING NICKNAME".getBytes()));
@@ -297,7 +368,7 @@ public class PingID {
 		String jwt = Jwts.builder().header().and()
 				// They also include a signature within the JWT
 				.claims(hashMap)
-				.claim("signature", f("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
+				.claim("signature", createSignature("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
 				.signWith(deviceKeyPair.getPrivate())
 				.compact();
 		
@@ -309,10 +380,10 @@ public class PingID {
 	
 	// FIFTH (and last) OPTIONAL STEP
 	// get_user_info
-	public JsonObject getUserInfo(JsonObject data) throws Exception
+	public JsonObject getUserInfo(JsonObject data)
 	{
 		// Build the JSON payload using org.json
-		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<String, Object>();
+		LinkedHashMap<String, Object> hashMap = new LinkedHashMap<>();
 		hashMap.put("id", id);
 		hashMap.put("meta_header", metaHeader);
 		hashMap.put("request_type", "get_user_info");
@@ -328,7 +399,7 @@ public class PingID {
 		String jwt = Jwts.builder().header().and()
 				// They also include a signature within the JWT
 				.claims(hashMap)
-				.claim("signature", f("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
+				.claim("signature", createSignature("SHA1withRSA", toJSON.getBytes(), deviceKeyPair.getPrivate())) // app key or private key??
 				.signWith(deviceKeyPair.getPrivate())
 				.compact();
 		
@@ -353,27 +424,21 @@ public class PingID {
 			sb.append(CHAR_POOL.charAt(idx));
 		}
 		
-		System.out.println(sb);
 		return sb.toString();
 	}
 	
-	public static String f(String algorithm, byte[] bytesTotal, PrivateKey privateKey) throws NoSuchAlgorithmException, SignatureException, InvalidKeyException
+	public static String createSignature(String algorithm, byte[] bytesTotal, PrivateKey privateKey)
 	{
-		Signature signature = Signature.getInstance(algorithm, bc);
-		signature.initSign(privateKey);
-		signature.update(bytesTotal);
-		return new String(Base64.getEncoder().encode(signature.sign()), StandardCharsets.UTF_8);
-	}
-	
-	public static String x(PublicKey publicKey)
-	{
-		return new String(Base64.getEncoder().encode(publicKey.getEncoded()));
-	}
-	
-	public static String w(long number)
-	{
-		String hexString = Long.toHexString(number);
-		return hexString.length() < 15 ? generateOTP(hexString, '0', 16) : hexString.substring((hexString.length() - 16) - 1, hexString.length() - 1);
+		try
+		{
+			Signature signature = Signature.getInstance(algorithm, bc);
+			signature.initSign(privateKey);
+			signature.update(bytesTotal);
+			return new String(Base64.getEncoder().encode(signature.sign()), StandardCharsets.UTF_8);
+		} catch(Exception e)
+		{
+			throw new RuntimeException(e);
+		}
 	}
 	
 	private static String generateOTP(String strNextLong, char c2, int length)
@@ -385,99 +450,60 @@ public class PingID {
 		return strNextLong;
 	}
 	
-	public static String g(byte[] publicKeyBytes, String encryptionCandidate) throws Exception
+	public static String createEncCountRegID(byte[] publicKeyBytes, String encryptionCandidate)
 	{
-		return e(u(publicKeyBytes), encryptionCandidate);
+		try
+		{
+			PublicKey key = KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(publicKeyBytes));
+			Cipher cipher = Cipher.getInstance(key.getAlgorithm(), "BC");
+			cipher.init(1, key);
+			return Base64.getEncoder().encodeToString(cipher.doFinal(encryptionCandidate.getBytes()));
+		} catch(Exception e)
+		{
+			throw new RuntimeException(e);
+		}
 	}
 	
-	public static String e(PublicKey publicKey, String encryptionCandidate) throws Exception
-	{
-		Cipher cipher = Cipher.getInstance(publicKey.getAlgorithm(), "BC");
-		cipher.init(1, publicKey);
-		return Base64.getEncoder().encodeToString(cipher.doFinal(encryptionCandidate.getBytes()));
-	}
-	
-	public static PublicKey u(byte[] publicKeyBytes) throws Exception
-	{
-		return KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(publicKeyBytes));
-	}
-	
-	private JsonObject sendRequest(HttpRequest request) throws Exception
+	private JsonObject sendRequest(HttpRequest request)
 	{
 		// Send request asynchronously
 		HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).connectTimeout(Duration.ofSeconds(10)).build();
-		HttpResponse<InputStream> response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
-		int statusCode = response.statusCode();
-		System.out.println("Response code: " + statusCode);
-		
-		String encoding = response.headers()
-				.map()
-				.getOrDefault("content-encoding", List.of("hi"))
-				.get(0);
-		
-		String responseBody;
-		
-		if(encoding.equals("gzip"))
+		try
 		{
-			responseBody = new String(new java.util.zip.GZIPInputStream(response.body()).readAllBytes(), StandardCharsets.UTF_8);
-		}
-		else
+			HttpResponse<InputStream> response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+			int statusCode = response.statusCode();
+			System.out.println("Response code: " + statusCode);
+			
+			String encoding = response.headers().map().getOrDefault("content-encoding", List.of("hi")).get(0);
+			
+			String responseBody;
+			
+			if(encoding.equals("gzip"))
+			{
+				responseBody = new String(new java.util.zip.GZIPInputStream(response.body()).readAllBytes(), StandardCharsets.UTF_8);
+			}
+			else
+			{
+				responseBody = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
+			}
+			
+			System.out.println("Raw response body: " + responseBody);
+			
+			// Decode JWT payload
+			String[] parts = responseBody.split("\\.");
+			if(parts.length == 3)
+			{
+				String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
+				System.out.println("Decoded JWT payload: " + payloadJson);
+				return JsonParser.parseString(payloadJson).getAsJsonObject();
+			}
+			else
+			{
+				throw new Exception("Response is not a valid JWT");
+			}
+		} catch(Exception e)
 		{
-			responseBody = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
+			throw new RuntimeException(e);
 		}
-		
-		System.out.println("Raw response body: " + responseBody);
-		
-		// Decode JWT payload
-		String[] parts = responseBody.split("\\.");
-		if(parts.length == 3)
-		{
-			String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-			System.out.println("Decoded JWT payload: " + payloadJson);
-			return JsonParser.parseString(payloadJson).getAsJsonObject();
-		}
-		else
-		{
-			throw new Exception("Response is not a valid JWT");
-		}
-	}
-	
-	public static void main(String[] args) throws Exception
-	{
-		// (new) OTP algorithm is fine
-		// 2 things we need to figure out
-		// 1. PARAM_SECRET? <-- harder probably because it has to do with cipher bs
-		// 2. PARAM_COUNTER??
-		// how are these generated
-		//		System.out.println(n("QWZieTBjcFl6d0NyRE9MQ2hDUU8=", "QdbHq7VN20v8wMUNPGhl"));
-		//		System.exit(0);
-		
-		// First activate the device
-		var ping = new PingID();
-		JsonObject init = ping.verifyActivationCode(activationCode);
-		ping.id = init.get("id").getAsString();
-		ping.session_id = init.get("session_id").getAsString();
-		init = ping.provision(init);
-		// Now do enc_sid stuff
-		//		KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "BC");
-		//		generator.initialize(2048); // Key size
-		//		var deviceKeyPair = generator.generateKeyPair();
-		//		PrivateKey privateKey = deviceKeyPair.getPrivate();
-		//		PublicKey publicKey = deviceKeyPair.getPublic();
-		var privateKey = ping.deviceKeyPair.getPrivate();
-		System.out.println(privateKey.getClass().getName());
-		//		String test = "PCy4sU4TMDILwU2/nGPsWPfl5W51Smrvuac2kBX4HY4si+hpD/8pFW6zexRsXLd6dkXQfxVBNIeBDMw/9LaI5rlvJnPVHCD1XuGVLjilOjn1Bo1weqmDdhuTfT/ux0UFg2z8eMgcjW2S3VLi4DQSNlUGeIcMP5brPqFdSaq52ppBYHLIAnct6ZmuljiLqXfJH8We3EWQ1yMi1bgJ2pO4mXc5NAY4hAZ74ZrQKSund0iSESQbFKHyBVisghxvZbkMSvMjy2om+3jHI9t2bhuWdjYusj1EMNGQO1Jpx5JfuioZCreRIC19P0Fhr1z6uWSXcBpob7jSLUBSBaPl9Ys1Kw==";
-		Cipher cipher = Cipher.getInstance("RSA", "BC");
-		cipher.init(Cipher.DECRYPT_MODE, privateKey);
-		System.out.println(privateKey.getAlgorithm() + " " + init.get("enc_sid").getAsString());
-		//		new String(cipher.doFinal(Base64.getDecoder().decode(test)));
-		ping.enc_sid = new String(cipher.doFinal(Base64.getDecoder().decode(init.get("enc_sid").getAsString())));
-		init = ping.testOTP(init);
-		if(init.get("response_status").getAsInt() != 0)
-			throw new Exception("test_otp failed");
-		ping.otpCounter = ping.incrementOTPCounter(ping.otpCounter);
-		
-		init = ping.finalizeOnboarding(init);
-		init = ping.getUserInfo(init);
 	}
 }

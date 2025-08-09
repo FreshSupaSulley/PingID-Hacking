@@ -1,3 +1,6 @@
+# My PingID data
+pingid_*
+
 .gradle
 build/
 !gradle/wrapper/gradle-wrapper.jar
